@@ -1,6 +1,7 @@
 use super::rangemap::RangeMap;
 use core::ffi;
 use im::hashmap as imhashmap;
+use im::Vector;
 use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
@@ -189,17 +190,30 @@ impl<'a> CallstackInterner {
 }
 
 /// A specific call to malloc()/calloc().
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Allocation {
+    address: usize,
     callstack_id: CallstackId,
     size: libc::size_t,
+}
+
+impl Ord for Allocation {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.address.cmp(&other.address)
+    }
+}
+
+impl PartialOrd for Allocation {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// The main data structure tracsking everything.
 struct AllocationTracker {
     // malloc()/calloc():
-    current_allocations: imhashmap::HashMap<usize, Allocation>,
-    peak_allocations: imhashmap::HashMap<usize, Allocation>,
+    current_allocations: Vector<Allocation>,
+    peak_allocations: Vector<Allocation>,
     // anonymous mmap(), i.e. not file backed:
     current_anon_mmaps: RangeMap<CallstackId>,
     peak_anon_mmaps: RangeMap<CallstackId>,
@@ -220,8 +234,8 @@ struct AllocationTracker {
 impl<'a> AllocationTracker {
     fn new(default_path: String) -> AllocationTracker {
         AllocationTracker {
-            current_allocations: imhashmap::HashMap::default(),
-            peak_allocations: imhashmap::HashMap::default(),
+            current_allocations: Vector::new(),
+            peak_allocations: Vector::new(),
             current_anon_mmaps: RangeMap::new(),
             peak_anon_mmaps: RangeMap::new(),
             interner: CallstackInterner::new(),
@@ -244,8 +258,12 @@ impl<'a> AllocationTracker {
     /// Add a new allocation based off the current callstack.
     fn add_allocation(&mut self, address: usize, size: libc::size_t, callstack: &Callstack) {
         let callstack_id = self.interner.get_or_insert_id(callstack);
-        let alloc = Allocation { callstack_id, size };
-        self.current_allocations.insert(address, alloc);
+        let alloc = Allocation {
+            address,
+            callstack_id,
+            size,
+        };
+        self.current_allocations.insert_ord(alloc);
         self.current_allocated_bytes += size;
         //self.allocation_added(size);
     }
@@ -256,8 +274,16 @@ impl<'a> AllocationTracker {
         self.check_if_new_peak();
         // Possibly this allocation doesn't exist; that's OK! It can if e.g. we
         // didn't capture an allocation for some reason.
-        if let Some(removed) = self.current_allocations.remove(&address) {
-            self.current_allocated_bytes -= removed.size;
+        match self.current_allocations.binary_search(&Allocation {
+            address,
+            callstack_id: 0,
+            size: 0,
+        }) {
+            Ok(index) => {
+                let removed = self.current_allocations.remove(index);
+                self.current_allocated_bytes -= removed.size;
+            }
+            Err(index) => (),
         }
     }
 
@@ -295,7 +321,12 @@ impl<'a> AllocationTracker {
         } else {
             &self.current_allocations
         };
-        for Allocation { callstack_id, size } in normal_allocations.values() {
+        for Allocation {
+            address,
+            callstack_id,
+            size,
+        } in normal_allocations
+        {
             let entry = by_call.entry(*callstack_id).or_insert(0);
             *entry += size;
         }
@@ -440,7 +471,7 @@ impl<'a> AllocationTracker {
             // we prevent reentrancy. We're not going to return to Python so
             // free()ing should be OK.
             let id_to_callstack = self.interner.get_reverse_map();
-            for (address, allocation) in self.current_allocations.iter() {
+            for allocation in self.current_allocations.iter() {
                 // Only clear large allocations that came out of a Python stack,
                 // to reduce chances of deallocating random important things.
                 if id_to_callstack
@@ -449,7 +480,7 @@ impl<'a> AllocationTracker {
                     .in_python()
                     && allocation.size > 300000
                 {
-                    libc::free(*address as *mut ffi::c_void);
+                    libc::free(allocation.address as *mut ffi::c_void);
                 }
             }
         }
@@ -603,7 +634,8 @@ fn write_flamegraph(
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocationTracker, CallSiteId, Callstack, CallstackInterner, FunctionId, FunctionLocation,
+        Allocation, AllocationTracker, CallSiteId, Callstack, CallstackInterner, FunctionId,
+        FunctionLocation,
     };
     use proptest::prelude::*;
     use std::collections;
@@ -777,7 +809,13 @@ mod tests {
         assert_eq!(tracker.peak_allocated_bytes, 2123);
         assert_eq!(tracker.peak_allocations, previous_peak);
         assert_eq!(tracker.current_allocations.len(), 1);
-        assert!(tracker.current_allocations.contains_key(&3));
+        /*assert!(tracker.current_allocations.contains(&(
+            3,
+            Allocation {
+                callstack_id: cs1_id,
+                size: 123
+            }
+        )));*/
         assert!(tracker.current_anon_mmaps.size() > 0);
         assert!(tracker.peak_anon_mmaps.size() == 0);
 
