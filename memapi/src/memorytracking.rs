@@ -1,9 +1,10 @@
 use super::rangemap::RangeMap;
+use archery;
 use core::ffi;
-use im::hashmap as imhashmap;
 use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
+use rpds::RedBlackTreeMap;
 use std::cell::RefCell;
 use std::collections;
 use std::collections::HashMap;
@@ -189,7 +190,7 @@ impl<'a> CallstackInterner {
 }
 
 /// A specific call to malloc()/calloc().
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 struct Allocation {
     callstack_id: CallstackId,
     size: libc::size_t,
@@ -198,8 +199,8 @@ struct Allocation {
 /// The main data structure tracsking everything.
 struct AllocationTracker {
     // malloc()/calloc():
-    current_allocations: imhashmap::HashMap<usize, Allocation>,
-    peak_allocations: imhashmap::HashMap<usize, Allocation>,
+    current_allocations: RedBlackTreeMap<usize, Allocation, archery::ArcK>,
+    peak_allocations: RedBlackTreeMap<usize, Allocation, archery::ArcK>,
     // anonymous mmap(), i.e. not file backed:
     current_anon_mmaps: RangeMap<CallstackId>,
     peak_anon_mmaps: RangeMap<CallstackId>,
@@ -220,8 +221,8 @@ struct AllocationTracker {
 impl<'a> AllocationTracker {
     fn new(default_path: String) -> AllocationTracker {
         AllocationTracker {
-            current_allocations: imhashmap::HashMap::default(),
-            peak_allocations: imhashmap::HashMap::default(),
+            current_allocations: RedBlackTreeMap::new_sync(),
+            peak_allocations: RedBlackTreeMap::default(),
             current_anon_mmaps: RangeMap::new(),
             peak_anon_mmaps: RangeMap::new(),
             interner: CallstackInterner::new(),
@@ -245,9 +246,8 @@ impl<'a> AllocationTracker {
     fn add_allocation(&mut self, address: usize, size: libc::size_t, callstack: &Callstack) {
         let callstack_id = self.interner.get_or_insert_id(callstack);
         let alloc = Allocation { callstack_id, size };
-        self.current_allocations.insert(address, alloc);
+        self.current_allocations.insert_mut(address, alloc);
         self.current_allocated_bytes += size;
-        //self.allocation_added(size);
     }
 
     /// Free an existing allocation.
@@ -256,8 +256,11 @@ impl<'a> AllocationTracker {
         self.check_if_new_peak();
         // Possibly this allocation doesn't exist; that's OK! It can if e.g. we
         // didn't capture an allocation for some reason.
-        if let Some(removed) = self.current_allocations.remove(&address) {
-            self.current_allocated_bytes -= removed.size;
+        let allocations = &mut self.current_allocations;
+        if let Some(removed) = allocations.get(&address) {
+            let size = removed.size;
+            allocations.remove_mut(&address);
+            self.current_allocated_bytes -= size;
         }
     }
 
@@ -776,7 +779,7 @@ mod tests {
         assert_eq!(tracker.current_allocated_bytes, 1123);
         assert_eq!(tracker.peak_allocated_bytes, 2123);
         assert_eq!(tracker.peak_allocations, previous_peak);
-        assert_eq!(tracker.current_allocations.len(), 1);
+        assert_eq!(tracker.current_allocations.size(), 1);
         assert!(tracker.current_allocations.contains_key(&3));
         assert!(tracker.current_anon_mmaps.size() > 0);
         assert!(tracker.peak_anon_mmaps.size() == 0);
