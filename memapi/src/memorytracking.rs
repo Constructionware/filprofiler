@@ -1,6 +1,6 @@
 use super::rangemap::RangeMap;
 use core::ffi;
-use im::hashmap as imhashmap;
+use im::hashmap::HashMap as ImHashMap;
 use inferno::flamegraph;
 use itertools::Itertools;
 use libc;
@@ -229,8 +229,8 @@ impl Allocation {
 /// The main data structure tracking everything.
 struct AllocationTracker {
     // malloc()/calloc():
-    current_allocations: imhashmap::HashMap<usize, Allocation>,
-    peak_allocations: imhashmap::HashMap<usize, Allocation>,
+    current_allocations: ImHashMap<u32, ImHashMap<u32, Allocation>>,
+    peak_allocations: ImHashMap<u32, ImHashMap<u32, Allocation>>,
     // anonymous mmap(), i.e. not file backed:
     current_anon_mmaps: RangeMap<CallstackId>,
     peak_anon_mmaps: RangeMap<CallstackId>,
@@ -248,11 +248,15 @@ struct AllocationTracker {
     default_path: String,
 }
 
+fn split_address(address: usize) -> (u32, u32) {
+    ((address >> 32) as u32, (address & 0xFFFFFFFF) as u32)
+}
+
 impl<'a> AllocationTracker {
     fn new(default_path: String) -> AllocationTracker {
         AllocationTracker {
-            current_allocations: imhashmap::HashMap::default(),
-            peak_allocations: imhashmap::HashMap::default(),
+            current_allocations: ImHashMap::default(),
+            peak_allocations: ImHashMap::default(),
             current_anon_mmaps: RangeMap::new(),
             peak_anon_mmaps: RangeMap::new(),
             interner: CallstackInterner::new(),
@@ -276,7 +280,11 @@ impl<'a> AllocationTracker {
     fn add_allocation(&mut self, address: usize, size: libc::size_t, callstack: &Callstack) {
         let callstack_id = self.interner.get_or_insert_id(callstack);
         let alloc = Allocation::new(callstack_id, size);
-        self.current_allocations.insert(address, alloc);
+        let (high_bits, low_bits) = split_address(address);
+        self.current_allocations
+            .entry(high_bits)
+            .or_insert_with(|| ImHashMap::default())
+            .insert(low_bits, alloc);
         self.current_allocated_bytes += size;
         //self.allocation_added(size);
     }
@@ -287,8 +295,11 @@ impl<'a> AllocationTracker {
         self.check_if_new_peak();
         // Possibly this allocation doesn't exist; that's OK! It can if e.g. we
         // didn't capture an allocation for some reason.
-        if let Some(removed) = self.current_allocations.remove(&address) {
-            self.current_allocated_bytes -= removed.size();
+        let (high_bits, low_bits) = split_address(address);
+        if let Some(submap) = self.current_allocations.get_mut(&high_bits) {
+            if let Some(removed) = submap.remove(&low_bits) {
+                self.current_allocated_bytes -= removed.size();
+            }
         }
     }
 
@@ -326,11 +337,12 @@ impl<'a> AllocationTracker {
         } else {
             &self.current_allocations
         };
-        for allocation in normal_allocations.values() {
-            let entry = by_call.entry(allocation.callstack_id).or_insert(0);
-            *entry += allocation.size();
+        for submap in normal_allocations.values() {
+            for allocation in submap.values() {
+                let entry = by_call.entry(allocation.callstack_id).or_insert(0);
+                *entry += allocation.size();
+            }
         }
-
         // Aggregate anonymous mmap()s:
         let anon_mmap_allocations = if peak {
             &self.peak_anon_mmaps
@@ -471,16 +483,20 @@ impl<'a> AllocationTracker {
             // we prevent reentrancy. We're not going to return to Python so
             // free()ing should be OK.
             let id_to_callstack = self.interner.get_reverse_map();
-            for (address, allocation) in self.current_allocations.iter() {
-                // Only clear large allocations that came out of a Python stack,
-                // to reduce chances of deallocating random important things.
-                if id_to_callstack
-                    .get(&allocation.callstack_id)
-                    .unwrap()
-                    .in_python()
-                    && allocation.size() > 300000
-                {
-                    libc::free(*address as *mut ffi::c_void);
+            for (highbit_address, submap) in self.current_allocations.iter() {
+                for (lowbit_address, allocation) in submap.iter() {
+                    // Only clear large allocations that came out of a Python stack,
+                    // to reduce chances of deallocating random important things.
+                    if id_to_callstack
+                        .get(&allocation.callstack_id)
+                        .unwrap()
+                        .in_python()
+                        && allocation.size() > 300000
+                    {
+                        let address: usize =
+                            ((*highbit_address as usize) << 32) | (*lowbit_address as usize);
+                        libc::free(address as *mut ffi::c_void);
+                    }
                 }
             }
         }
